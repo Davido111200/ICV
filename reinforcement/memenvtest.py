@@ -39,32 +39,11 @@ from LIVE.inference import generate_answers, get_icv
 from parlai.utils.safety import OffensiveLanguageClassifier
 
 
-class HiddenStateNormalizer:
-    def __init__(self):
-        self.running_mean = None
-        self.running_std = None
-        self.count = 0
-
-    def update(self, embeddings):
-        # Update running mean and std
-        batch_mean = embeddings.mean(dim=0)
-        batch_std = embeddings.std(dim=0)
-
-        if self.running_mean is None:
-            self.running_mean = batch_mean
-            self.running_std = batch_std
-        else:
-            # Weighted average for running mean and std
-            total_count = self.count + embeddings.size(0)
-            self.running_mean = (self.running_mean * self.count + batch_mean * embeddings.size(0)) / total_count
-            self.running_std = (self.running_std * self.count + batch_std * embeddings.size(0)) / total_count
-            self.count = total_count
-
-    def normalize(self, embeddings):
-        # Normalize embeddings using running mean and std
-        return (embeddings - self.running_mean) / (self.running_std + 1e-8)  # Avoid division by zero
-
-
+import torch
+import torch.nn as nn
+import torch.optim as optim
+import torch.nn.functional as F
+from torch.utils.data import DataLoader, Dataset
 
 class MemEnvTest(gymnasium.Env):
     def __init__(self, args, model_name, model, tokenizer, train_dataset, eval_dataset, raw_train_data):
@@ -211,19 +190,17 @@ class MemEnvTest(gymnasium.Env):
             # Function to chunk the
             # tokenized output into chunks of self.args.chunk_size tokens
             def chunk_tokens(tokens):
-                return [tokens[i:i + self.args.chunk_size] for i in range(0, len(tokens), self.args.chunk_size)]
+                return [tokens[0:i + self.args.chunk_size] for i in range(0, len(tokens), self.args.chunk_size)]
             
             # Create chunks of self.args.chunk_size tokens
             token_chunks = chunk_tokens(tokenized_output)
-            
 
             # Add metadata context for retrieval
-            chunks_with_metadata = {'sentence': original_sentence, 'steering_vector': icv.detach().clone(), 'chunks': {'chunk_sentence': []}}
+            chunks_with_metadata = {'sentence': original_sentence, 'steering_vector': icv.detach().clone(), 'chunks': {'chunk_sentence': [], "chunk_length": [], 'full_chunk_length': len(tokenized_output)}}
             for chunk in token_chunks:
                 chunk_text = self.tokenizer.convert_tokens_to_string(chunk)
                 chunks_with_metadata['chunks']['chunk_sentence'].append(chunk_text)
-
-                
+                chunks_with_metadata['chunks']['chunk_length'].append(len(chunk))
         
         # Existing cleanup and return
         self.current_data_idx += 1
@@ -352,67 +329,6 @@ class MemEnvEvalTest(gymnasium.Env):
         # update the current training sample
         return state, {}
 
-    # def step(self, action):
-    #     original_sentence = self.raw_eval_data[self.current_data_idx]['query'][0]
-    #     reference = self.raw_eval_data[self.current_data_idx]['query'][1]
-
-    #     self.current_state = self._get_hidden_state(original_sentence)
-
-    #     icv, uncertainty = self.memory.read(self.args, self.current_state, distance_metric=self.args.distance_metric, k=self.args.n_neighbors)
-
-    #     # # directly mix the global ICV with the current ICV
-    #     if self.args.mix_icv:
-    #         final_icv = (1 - uncertainty) * icv + uncertainty * self.global_icv
-    #     else:
-    #         final_icv = icv
-
-    #     # add the ICV to the current state
-    #     add_icv_layers(self.model, torch.stack([final_icv],dim=1).cuda(), [self.args.lam])
-    
-    #     if 'llama-2' in self.args.model_type:
-    #         gen_args = {
-    #             'temperature': 0.45,
-    #             'do_sample': True,
-    #             'top_k': 0,
-    #             'top_p': 1.0,
-    #             'eos_token_id': [1642, 13492, 26036, 29908,self.tokenizer.encode('.10')[-1], self.tokenizer.encode('\n')[-1]]
-    #         }
-    #     elif 'falcon' in self.args.model_type:
-    #         gen_args = {
-    #             'do_sample': False,
-    #             'num_beams': 10,
-    #             'eos_token_id': [104, 193, 1001, 25, 1702, 18858, 3166]
-    #         }
-    #     else:
-    #         gen_args = {}
-        
-    #     with torch.no_grad():
-    #         input_id = self.eval_dataset[self.current_data_idx][0].unsqueeze(0) # ensure 2d input_ids
-    #         attention_mask = self.eval_dataset[self.current_data_idx][1].unsqueeze(0)
-    #         generation_output = self.model.generate(
-    #             input_ids=input_id.cuda(),
-    #             attention_mask=attention_mask.cuda(),
-    #             max_new_tokens=32,
-    #             pad_token_id=self.tokenizer.eos_token_id,
-    #             **gen_args,
-    #         )
-
-    #         generation_output = self.tokenizer.decode(generation_output[0][len(input_id[0]):]).replace("\n","").replace("{","").replace("}","").replace('"','').strip('".').replace(',,','').replace('original','').replace('Original','').split('rewritten')[0].split('revised')[0].replace('10','').split('.')[0]
-
-    #     # NOTE: Evaluation is done on the result file    
-    #     self.current_reward = self.evaluate(self.args.metric, generation_output, reference)
-
-    #     # update the total time steps
-    #     self.current_data_idx += 1
-    #     self.steps += 1
-
-    #     terminated = True
-
-    #     # remove the layer
-    #     remove_icv_layers(self.model)
-
-    #     return self._get_current_state(), self.current_reward, terminated, {"original_sentence": original_sentence, "icv": icv.detach().clone(), "generation": generation_output, "reference": reference}
-
 
     def step(self, action):
         original_sentence = self.raw_eval_data[self.current_data_idx]['query'][0]
@@ -470,17 +386,28 @@ class MemEnvEvalTest(gymnasium.Env):
                 generation_output = self.model.generate(
                     input_ids=input_id.cuda(),
                     attention_mask=attention_mask.cuda(),
-                    max_new_tokens=self.args.chunk_size,  # Generate one token at a time
+                    max_new_tokens=self.args.chunk_size,  # Generate self.args.chunk_size token at a time
                     pad_token_id=self.tokenizer.eos_token_id,
                     **gen_args,
                 )
                 
-                # Extract the next self.args.chunk_size tokens
-                next_tokens_id = generation_output[0, -self.args.chunk_size:]
+                # NOTE: We have to calculate the number of generated tokens first
+                total_generated_tokens = generation_output.shape[1] - input_id.shape[1]
+                next_tokens_id = generation_output[0, -min(self.args.chunk_size, total_generated_tokens):]
 
                 # Stop if the next token is EOS
                 if any(next_tokens_id) in gen_args['eos_token_id']:
                     remove_icv_layers(self.model)
+                    # Append the next tokens to input_id
+                    input_id = torch.cat([input_id, next_tokens_id.view(1, -1).cpu()], dim=1)
+                    # Append the next tokens to current_answer_id
+                    cur_answer_id = torch.cat([cur_answer_id, next_tokens_id.view(1, -1).cpu()], dim=1)
+
+
+                    # get the next token
+                    current_sentence_with_ins = self.tokenizer.decode(input_id[0], skip_special_tokens=True)
+                    cur_answer = self.tokenizer.decode(cur_answer_id[0], skip_special_tokens=True)
+
                     break
                 
                 # Append the next tokens to input_id
@@ -497,11 +424,10 @@ class MemEnvEvalTest(gymnasium.Env):
                 cur_num_token += len(next_tokens_id)
             remove_icv_layers(self.model)
 
-        
+
 
         # get the part to the right of Paraphrase, and get the text in between the first and last quotation marks
         generated_output = current_sentence_with_ins.split('Paraphrase')[1].split('"')[1]
-        
         self.current_reward = None
         self.current_data_idx += 1
 
